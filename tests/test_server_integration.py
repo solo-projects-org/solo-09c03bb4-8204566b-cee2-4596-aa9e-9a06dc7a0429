@@ -11,6 +11,7 @@ import gzip
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -29,6 +30,15 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _vm_hwm(pid: int) -> int:
+    """进程峰值常驻内存（kB），Linux /proc 接口。"""
+    with open(f"/proc/{pid}/status") as fh:
+        for line in fh:
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1])
+    raise RuntimeError("VmHWM not found")
 
 
 @pytest.fixture(scope="module")
@@ -261,3 +271,125 @@ def test_cancel_during_slow_upload_waits_and_cleans(server):
                    {"Content-Type": "application/gzip"})
     assert code == 409
     assert list(bdir.iterdir()) == []
+
+
+def test_high_ratio_chunk_streams_quota_and_other_batch_stays_responsive(server):
+    """报告场景：一个请求块里压着远超单批配额的高压缩率数据。
+
+    正确行为：收到该压缩块即边解压边核算，超限及时 413 并清掉本批，且拒绝时
+    只做过「一块」展开（不是先把整包展开到内存）；同时另一批的查询 / 上传 /
+    取消不受影响。这里把服务端配额调小到 1 MiB 以放大差距（接收链相同）。
+    """
+    import threading
+
+    # 高压缩率数据：约 16 MiB 展开体积，单块压缩后仅约 70 KiB
+    records = []
+    for i in range(40_000):
+        records.append((b"read", b"A" * 200, b"I" * 200))
+    blob = _make_gz(records)
+    assert len(blob) < 256 * 1024
+    assert len(blob) * 100 < 16 * 1024 * 1024
+
+    # 用独立服务实例，避免影响其它测试共享的 64 MiB 上限
+    data_dir = Path(tempfile.mkdtemp(prefix="fastq-ratio-")) / "data"
+    port = _free_port()
+    env = {
+        **os.environ,
+        "FASTQ_DATA_DIR": str(data_dir),
+        "FASTQ_BATCH_BYTE_LIMIT": str(1024 * 1024),
+        "PYTHONPATH": str(REPO_ROOT),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
+         "--port", str(port), "--log-level", "warning"],
+        cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    local = {"base": f"http://127.0.0.1:{port}", "data_dir": data_dir, "proc": proc}
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(local["base"] + "/health", timeout=1) as r:
+                if r.status == 200:
+                    break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        proc.terminate()
+        pytest.fail("ratio server did not start")
+
+    try:
+        _, body = _req(local, "POST", "/batches",
+                       json.dumps({"sample_id": "ratio-bomb"}).encode(),
+                       {"Content-Type": "application/json"})
+        bomb = body["id"]
+
+        # 以 32 KiB 为一块发送，模拟真实请求分块
+        def gen():
+            for i in range(0, len(blob), 32 * 1024):
+                yield blob[i : i + 32 * 1024]
+
+        result = {}
+
+        def upload():
+            req = urllib.request.Request(
+                local["base"] + f"/batches/{bomb}/files/R1",
+                data=gen(),
+                headers={"Content-Type": "application/gzip"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    result["status"] = r.status
+                    result["body"] = json.loads(r.read() or b"{}")
+            except urllib.error.HTTPError as e:
+                result["status"] = e.code
+                result["body"] = json.loads(e.read() or b"{}")
+
+        before_hwm = _vm_hwm(proc.pid)
+        t = threading.Thread(target=upload)
+        t.start()
+
+        # 超限上传在途时，服务端仍能及时响应其他批的创建/查询/上传/取消
+        t0 = time.time()
+        _, b2 = _req(local, "POST", "/batches",
+                     json.dumps({"sample_id": "ratio-other"}).encode(),
+                     {"Content-Type": "application/json"})
+        other = b2["id"]
+        assert _req(local, "GET", f"/batches/{other}")[0] == 200
+        r1, r2 = _pair(4)
+        assert _req(local, "POST", f"/batches/{other}/files/R1", _make_gz(r1),
+                    {"Content-Type": "application/gzip"})[0] == 200
+        code, body = _req(local, "POST", f"/batches/{other}/files/R2", _make_gz(r2),
+                          {"Content-Type": "application/gzip"})
+        assert code == 200 and body["status"] == "ready"
+
+        _, b3 = _req(local, "POST", "/batches",
+                     json.dumps({"sample_id": "ratio-cancel"}).encode(),
+                     {"Content-Type": "application/json"})
+        assert _req(local, "POST", f"/batches/{b3['id']}/cancel")[1]["status"] == "cancelled"
+        elapsed = time.time() - t0
+        assert elapsed < 10, f"other batches were blocked for {elapsed:.1f}s"
+
+        t.join(timeout=60)
+        assert not t.is_alive()
+
+        # 超限批：及时 413、失败、目录清空
+        assert result["status"] == 413, result
+        assert "quota" in result["body"]["detail"]
+        # 关键回归：拒绝时只多做了「一块」的展开量，而不是整包展开（约 16 MiB）
+        detail = result["body"]["detail"]
+        attempted = int(re.search(r"attempted=(\d+)", detail).group(1))
+        assert attempted <= 64 * 1024, detail  # 展开块 <= 64 KiB
+        # 服务端峰值内存不应因该次解压暴涨（旧实现会先把整包展开，涨 ~16 MiB）
+        after = _vm_hwm(proc.pid)
+        assert after - before_hwm < 8 * 1024, (before_hwm, after)
+
+        _, detail = _req(local, "GET", f"/batches/{bomb}")
+        assert detail["status"] == "failed"
+        assert list((data_dir / "batches" / bomb).iterdir()) == []
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()

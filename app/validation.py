@@ -1,7 +1,13 @@
 """流式 gzip 解压与四行制 FASTQ 校验。
 
-所有落盘字节（压缩临时文件 + 展开结果）在写入前都经过 SpaceManager 预留，
-因此解压炸弹 / 超大压缩包会在接收过程中触发配额错误，而不是等落盘后才发现。
+展开过程使用带 ``max_length`` 的有界 ``decompress``：每次只在内存中产生一小块
+（默认 64 KiB）展开数据，随即向 SpaceManager 预留配额并落盘。因此：
+
+* 即使单个请求块是几十 KiB 的高压缩率 gzip（可展开到几十 MiB），也不会先在内存
+  里生成整块结果，内存中最多只多出一块的展开数据；
+* 超限在解压途中即被发现（最多多做一块），而不是等整包解完才报；
+* 块与块之间 ``await`` 落盘（并让出事件循环），其他批次的查询 / 上传 / 取消
+  不会被这次展开拖住。
 """
 
 from __future__ import annotations
@@ -12,9 +18,85 @@ from typing import BinaryIO, Iterator
 
 from .storage import QuotaExceededError, SpaceManager
 
+# 单次 decompress 最多产生的展开字节数，也是配额核算 / 事件循环让出的粒度。
+DECOMPRESS_PIECE_BYTES = 64 * 1024
+# 喂给解压器的单块压缩字节上限。zlib 每次返回都会复制 unconsumed_tail，
+# 若直接把一个超大请求块整块喂进去会退化成 O(n^2) 复制；这里先自行切片。
+DECOMPRESS_INPUT_BYTES = 64 * 1024
+
 
 class StreamError(Exception):
     """上传流处理过程中的可预期错误（坏 gzip / 客户端中断等）。"""
+
+
+class _GzipExpander:
+    """增量、有界内存的单成员 gzip 解压器。
+
+    ``feed()`` 是同步生成器：每次迭代最多产出 ``piece_bytes`` 字节展开数据，
+    调用方可以逐块核算配额、落盘并在块间让出事件循环。解压本身的状态很小，
+    不会随展开体积增长。
+    """
+
+    def __init__(
+        self,
+        piece_bytes: int = DECOMPRESS_PIECE_BYTES,
+        input_bytes: int = DECOMPRESS_INPUT_BYTES,
+    ) -> None:
+        if piece_bytes <= 0 or input_bytes <= 0:
+            raise ValueError("piece_bytes and input_bytes must be positive")
+        self._piece_bytes = piece_bytes
+        self._input_bytes = input_bytes
+        self._decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        self._fed = False
+
+    def feed(self, data: bytes) -> Iterator[bytes]:
+        """喂入一块压缩字节，按 ``piece_bytes`` 为上限产出展开数据。
+
+        坏流抛 ``zlib.error`` -> ``StreamError``；gzip 结束标记之后仍有数据
+        （多成员归档 / 尾随数据）同样拒绝。
+        """
+        if self._decomp.eof:
+            # 上一个块已经到达结束标记，这里出现的任何字节都是尾随数据
+            raise StreamError("multi-member gzip archives are not accepted")
+        self._fed = True
+        chunk_size = self._input_bytes
+        total = len(data)
+        for start in range(0, total, chunk_size):
+            piece = data[start : start + chunk_size]
+            is_last_slice = start + chunk_size >= total
+            while True:
+                try:
+                    out = self._decomp.decompress(piece, self._piece_bytes)
+                except zlib.error as exc:
+                    raise StreamError(f"corrupt gzip stream: {exc}") from exc
+                piece = self._decomp.unconsumed_tail
+
+                if out:
+                    yield out
+
+                if self._decomp.eof:
+                    # 本块内到达结束标记；本片剩余字节或后续切片都算尾随数据
+                    if not is_last_slice or piece or self._decomp.unused_data:
+                        raise StreamError("multi-member gzip archives are not accepted")
+                    return
+                if not piece and len(out) < self._piece_bytes:
+                    # 该输入片已全部消费，且没有更多缓冲输出
+                    break
+                # 否则 unconsumed_tail 里还有被 max_length 截住的输入，继续
+
+    def finish(self) -> Iterator[bytes]:
+        """压缩流结束后调用：确认正常结束标记，并以有界方式兜底残余输出。"""
+        if not self._fed:
+            raise StreamError("empty request body")
+        if not self._decomp.eof:
+            raise StreamError("truncated gzip stream: missing end-of-stream marker")
+        # eof 后输入已全部消费，正常路径下没有缓冲输出；这里用带 max_length 的
+        # decompress(b"") 兜底，避免任何可能的大块 flush() 一次性进内存。
+        while True:
+            tail = self._decomp.decompress(b"", self._piece_bytes)
+            if not tail:
+                return
+            yield tail
 
 
 async def stream_gunzip(
@@ -27,24 +109,25 @@ async def stream_gunzip(
     cancel_event,
     idle_timeout: float = 15.0,
 ) -> int:
-    """读取请求体，一边把原始 gzip 字节写入临时文件，一边流式展开到 out_path。
+    """读取请求体，一边把原始 gzip 字节写入临时文件，一边有界地流式展开。
 
-    两条落盘流都按真实字节数向 SpaceManager 预留空间。
+    落盘分两类，都在写入前按真实字节数向 SpaceManager 预留：
+    压缩临时文件的每个请求块，以及展开结果的每个 ``DECOMPRESS_PIECE_BYTES`` 块。
     返回展开后的总字节数。取消 / 坏包 / 超限 / 静默超时均抛异常，由调用方清理本批。
     """
     import asyncio
 
     import aiofiles
 
-    decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    expander = _GzipExpander()
     out_written = 0
     got_any = False
+    cancelled: list[bool] = [False]
 
     gz_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     body_stream = request.stream()
-    cancelled: list[bool] = [False]
 
     async def _next_chunk():
         # 每个块最多等 idle_timeout 秒，客户端长时间静默即中断本批
@@ -53,6 +136,27 @@ async def stream_gunzip(
         if cancel_event.is_set():
             cancelled[0] = True
         return chunk
+
+    async def _drain(gen, out_f) -> None:
+        """逐块核算配额并落盘展开数据；取消时关闭生成器并停止。"""
+        nonlocal out_written
+        try:
+            for plain in gen:
+                if cancel_event.is_set():
+                    cancelled[0] = True
+                    return
+                # 展开数据边产生边核算：先预留这一块再落盘，绝不先攒整块结果
+                await space.reserve(batch_id, len(plain))
+                try:
+                    await out_f.write(plain)
+                except BaseException:
+                    await space.release(batch_id, len(plain))
+                    raise
+                out_written += len(plain)
+                # 每块之后让出事件循环，其他批次的请求得以推进
+                await asyncio.sleep(0)
+        finally:
+            gen.close()
 
     try:
         async with aiofiles.open(gz_path, "wb") as gz_f, aiofiles.open(out_path, "wb") as out_f:
@@ -80,20 +184,14 @@ async def stream_gunzip(
                     await space.release(batch_id, len(chunk))
                     raise
 
-                # 2) 流式解压；坏 gzip 在此抛 zlib.error
-                try:
-                    plain = decomp.decompress(chunk)
-                except zlib.error as exc:
-                    raise StreamError(f"corrupt gzip stream: {exc}") from exc
+                # 2) 有界流式解压：一个请求块可能展开成很多块，逐块核算并落盘
+                await _drain(expander.feed(chunk), out_f)
+                if cancelled[0]:
+                    break
 
-                if plain:
-                    await space.reserve(batch_id, len(plain))
-                    try:
-                        await out_f.write(plain)
-                        out_written += len(plain)
-                    except BaseException:
-                        await space.release(batch_id, len(plain))
-                        raise
+            # 3) 必须到达 gzip 流正常结束点；残留输出同样按块核算
+            if not cancelled[0]:
+                await _drain(expander.finish(), out_f)
     except QuotaExceededError:
         raise
     except StreamError:
@@ -107,23 +205,6 @@ async def stream_gunzip(
 
     if not got_any:
         raise StreamError("empty request body")
-
-    # 3) 必须到达 gzip 流正常结束点
-    try:
-        tail = decomp.flush()
-    except zlib.error as exc:
-        raise StreamError(f"corrupt gzip stream: {exc}") from exc
-    if tail:
-        await space.reserve(batch_id, len(tail))
-        async with aiofiles.open(out_path, "ab") as out_f:
-            await out_f.write(tail)
-        out_written += len(tail)
-    if not decomp.eof:
-        raise StreamError("truncated gzip stream: missing end-of-stream marker")
-
-    # 4) 只收单成员 gzip：结束标记之后不允许还有数据
-    if decomp.unused_data:
-        raise StreamError("multi-member gzip archives are not accepted")
 
     return out_written
 

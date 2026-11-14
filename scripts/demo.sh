@@ -39,6 +39,7 @@ curl -sS "$BASE/health" | python3 -m json.tool
 
 run_case "normal" "normal"
 run_case "mismatch" "mismatch"
+run_case "high_ratio" "high_ratio"
 run_case "oversized" "oversized"
 
 echo
